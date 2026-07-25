@@ -1,0 +1,11 @@
+[package]
+name = "forge-core"
+description = "Host-neutral abstractions for Git hosting service integrations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }

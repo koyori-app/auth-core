@@ -1,0 +1,16 @@
+[package]
+name = "forge-github"
+description = "GitHub App API client: app JWT, installation access tokens, repositories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forge-core = { path = "../forge-core", version = "0.1.0" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }

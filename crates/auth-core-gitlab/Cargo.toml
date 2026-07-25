@@ -1,0 +1,17 @@
+[package]
+name = "auth-core-gitlab"
+description = "GitLab (SaaS and self-hosted) OAuth login provider for auth-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+auth-core = { path = "../auth-core", version = "0.1.0" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
