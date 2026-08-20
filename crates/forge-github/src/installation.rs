@@ -13,6 +13,25 @@ use crate::jwt::create_app_jwt;
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const DEFAULT_USER_AGENT: &str = "forge-github";
 const ACCEPT_GITHUB_JSON: &str = "application/vnd.github+json";
+/// `/installation/repositories` の 1 ページあたり件数（GitHub の上限）。
+/// 既定は 30 件で、org のインストールは簡単に超える。
+const REPOSITORIES_PER_PAGE: usize = 100;
+/// ページ送りの上限。1 インストールで 10,000 リポジトリは実運用では出ない。
+const REPOSITORIES_MAX_PAGES: usize = 100;
+
+/// 次のページを取りに行くか。
+///
+/// 1 ページ分に満たない応答が来たら終わり。`total_count` が分かる場合は、
+/// 総数に達した時点でも打ち切る（末尾ページがちょうど満杯のときの無駄打ちを防ぐ）。
+fn has_more_repositories(fetched: usize, collected: usize, total_count: Option<usize>) -> bool {
+    if fetched < REPOSITORIES_PER_PAGE {
+        return false;
+    }
+    match total_count {
+        Some(total) => collected < total,
+        None => true,
+    }
+}
 
 /// インストール情報。
 #[derive(Debug, Clone)]
@@ -55,6 +74,10 @@ struct RepositoryJson {
 
 #[derive(Debug, Deserialize)]
 struct InstallationRepositoriesJson {
+    /// インストールが見えるリポジトリの総数。GitHub は常に返すが、
+    /// 欠けていてもページ末尾の判定だけで打ち切れるようにしておく。
+    #[serde(default)]
+    total_count: Option<usize>,
     repositories: Vec<RepositoryJson>,
 }
 
@@ -218,28 +241,38 @@ impl GithubApp {
         &self,
         installation_access_token: &str,
     ) -> Result<Vec<Repository>, anyhow::Error> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                "/installation/repositories",
-                installation_access_token,
-            )
-            .send()
-            .await
-            .context("github list installation repositories")?;
-        let body: InstallationRepositoriesJson =
-            parse_ok(response, "github list repositories").await?;
+        let mut repositories = Vec::new();
 
-        body.repositories
-            .into_iter()
-            .map(|repo| {
+        for page in 1..=REPOSITORIES_MAX_PAGES {
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!(
+                        "/installation/repositories?per_page={REPOSITORIES_PER_PAGE}&page={page}"
+                    ),
+                    installation_access_token,
+                )
+                .send()
+                .await
+                .context("github list installation repositories")?;
+            let body: InstallationRepositoriesJson =
+                parse_ok(response, "github list repositories").await?;
+
+            let fetched = body.repositories.len();
+            for repo in body.repositories {
                 let (_, name) = repo
                     .full_name
                     .split_once('/')
                     .ok_or_else(|| anyhow!("invalid repository full_name: {}", repo.full_name))?;
-                Ok(Repository::new(repo.owner.login, name))
-            })
-            .collect()
+                repositories.push(Repository::new(repo.owner.login, name));
+            }
+
+            if !has_more_repositories(fetched, repositories.len(), body.total_count) {
+                break;
+            }
+        }
+
+        Ok(repositories)
     }
 }
 
@@ -327,6 +360,37 @@ mod tests {
     use super::*;
 
     const MAX_AGE_SECS: i64 = 600;
+
+    #[test]
+    fn stops_when_page_is_not_full() {
+        assert!(!has_more_repositories(30, 30, Some(30)));
+        assert!(!has_more_repositories(0, 100, Some(100)));
+    }
+
+    #[test]
+    fn continues_while_pages_are_full() {
+        // 既定の 30 件で切れていた頃の境界。次のページを取りに行く。
+        assert!(has_more_repositories(
+            REPOSITORIES_PER_PAGE,
+            REPOSITORIES_PER_PAGE,
+            Some(250)
+        ));
+        // total_count が無くても、満杯なら続ける
+        assert!(has_more_repositories(
+            REPOSITORIES_PER_PAGE,
+            REPOSITORIES_PER_PAGE,
+            None
+        ));
+    }
+
+    #[test]
+    fn stops_when_total_count_is_reached_on_a_full_page() {
+        assert!(!has_more_repositories(
+            REPOSITORIES_PER_PAGE,
+            REPOSITORIES_PER_PAGE,
+            Some(REPOSITORIES_PER_PAGE)
+        ));
+    }
 
     fn now() -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339("2026-07-26T12:00:00Z").unwrap()
