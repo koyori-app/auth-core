@@ -7,10 +7,12 @@ use forge_core::{Repository, TokenProvider};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::GithubAppCredentials;
 use crate::jwt::create_app_jwt;
+use crate::{GithubAppCredentials, GithubAppOAuthCredentials};
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
+/// OAuth のトークン交換は API ではなく github.com 側にある。
+const DEFAULT_OAUTH_BASE: &str = "https://github.com";
 const DEFAULT_USER_AGENT: &str = "forge-github";
 const ACCEPT_GITHUB_JSON: &str = "application/vnd.github+json";
 /// `/installation/repositories` の 1 ページあたり件数（GitHub の上限）。
@@ -18,13 +20,22 @@ const ACCEPT_GITHUB_JSON: &str = "application/vnd.github+json";
 const REPOSITORIES_PER_PAGE: usize = 100;
 /// ページ送りの上限。1 インストールで 10,000 リポジトリは実運用では出ない。
 const REPOSITORIES_MAX_PAGES: usize = 100;
+/// `/user/installations` の 1 ページあたり件数（GitHub の上限）。
+const INSTALLATIONS_PER_PAGE: usize = 100;
+/// ページ送りの上限。1 ユーザーが 10,000 インストールに属することは実運用では出ない。
+const INSTALLATIONS_MAX_PAGES: usize = 100;
 
 /// 次のページを取りに行くか。
 ///
 /// 1 ページ分に満たない応答が来たら終わり。`total_count` が分かる場合は、
 /// 総数に達した時点でも打ち切る（末尾ページがちょうど満杯のときの無駄打ちを防ぐ）。
-fn has_more_repositories(fetched: usize, collected: usize, total_count: Option<usize>) -> bool {
-    if fetched < REPOSITORIES_PER_PAGE {
+fn has_more_pages(
+    fetched: usize,
+    collected: usize,
+    total_count: Option<usize>,
+    per_page: usize,
+) -> bool {
+    if fetched < per_page {
         return false;
     }
     match total_count {
@@ -73,6 +84,27 @@ struct RepositoryJson {
 }
 
 #[derive(Debug, Deserialize)]
+struct UserInstallationJson {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInstallationsJson {
+    /// そのユーザーが見えるインストールの総数。
+    #[serde(default)]
+    total_count: Option<usize>,
+    installations: Vec<UserInstallationJson>,
+}
+
+/// OAuth のトークン交換の応答。GitHub は失敗時も 200 を返し、
+/// `error` フィールドで理由を伝えてくる。
+#[derive(Debug, Deserialize)]
+struct UserAccessTokenJson {
+    access_token: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct InstallationRepositoriesJson {
     /// インストールが見えるリポジトリの総数。GitHub は常に返すが、
     /// 欠けていてもページ末尾の判定だけで打ち切れるようにしておく。
@@ -86,8 +118,10 @@ struct InstallationRepositoriesJson {
 pub struct GithubApp {
     http: Client,
     api_base: String,
+    oauth_base: String,
     user_agent: String,
     credentials: GithubAppCredentials,
+    oauth_credentials: Option<GithubAppOAuthCredentials>,
 }
 
 impl GithubApp {
@@ -95,14 +129,33 @@ impl GithubApp {
         Self {
             http,
             api_base: DEFAULT_API_BASE.to_string(),
+            oauth_base: DEFAULT_OAUTH_BASE.to_string(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             credentials,
+            oauth_credentials: None,
         }
     }
 
     /// API のベース URL を差し替える（GitHub Enterprise やテスト用のスタブ向け）。
     pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
         self.api_base = api_base.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// OAuth（ユーザー認可）のベース URL を差し替える。
+    ///
+    /// トークン交換だけは `api.github.com` ではなく `github.com` 側にあるため、
+    /// [`Self::with_api_base`] とは別に持つ。
+    pub fn with_oauth_base(mut self, oauth_base: impl Into<String>) -> Self {
+        self.oauth_base = oauth_base.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// インストール時のユーザー認可に使う資格情報を設定する。
+    ///
+    /// これを渡さないと [`Self::verify_installation_access`] は使えない。
+    pub fn with_oauth_credentials(mut self, credentials: GithubAppOAuthCredentials) -> Self {
+        self.oauth_credentials = Some(credentials);
         self
     }
 
@@ -267,12 +320,106 @@ impl GithubApp {
                 repositories.push(Repository::new(repo.owner.login, name));
             }
 
-            if !has_more_repositories(fetched, repositories.len(), body.total_count) {
+            if !has_more_pages(
+                fetched,
+                repositories.len(),
+                body.total_count,
+                REPOSITORIES_PER_PAGE,
+            ) {
                 break;
             }
         }
 
         Ok(repositories)
+    }
+
+    /// インストール時のユーザー認可で受け取った `code` を、ユーザーアクセストークンに交換する。
+    ///
+    /// GitHub は code が無効・使用済み・期限切れのときも HTTP 200 を返し、
+    /// `error` フィールドで理由を伝えてくる。その場合は `Ok(None)` にして、
+    /// 通信できなかった場合（`Err`）と区別できるようにしている。
+    pub async fn exchange_user_code(&self, code: &str) -> Result<Option<String>, anyhow::Error> {
+        let credentials = self
+            .oauth_credentials
+            .as_ref()
+            .ok_or_else(|| anyhow!("github app oauth credentials are not configured"))?;
+
+        let response = self
+            .http
+            .post(format!("{}/login/oauth/access_token", self.oauth_base))
+            .header("Accept", "application/json")
+            .header("User-Agent", self.user_agent.clone())
+            .form(&[
+                ("client_id", credentials.client_id.as_str()),
+                ("client_secret", credentials.client_secret.as_str()),
+                ("code", code),
+            ])
+            .send()
+            .await
+            .context("github exchange user code")?;
+
+        let body: UserAccessTokenJson = parse_ok(response, "github exchange user code").await?;
+        if body.error.is_some() {
+            // code そのものが無効・使用済み・期限切れ。拒否として扱う。
+            return Ok(None);
+        }
+        match body.access_token {
+            Some(token) if !token.is_empty() => Ok(Some(token)),
+            // error も access_token も無い応答は想定外なので、拒否ではなく異常として扱う。
+            _ => Err(anyhow!("github exchange user code returned no access token")),
+        }
+    }
+
+    /// ユーザーアクセストークンで、そのユーザーがアクセスできるインストールを列挙する。
+    ///
+    /// App JWT でも Installation Access Token でもなく、
+    /// [`Self::exchange_user_code`] で得たユーザーアクセストークンを使う。
+    pub async fn list_user_installation_ids(
+        &self,
+        user_access_token: &str,
+    ) -> Result<Vec<i64>, anyhow::Error> {
+        let mut ids = Vec::new();
+
+        for page in 1..=INSTALLATIONS_MAX_PAGES {
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/user/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}"),
+                    user_access_token,
+                )
+                .send()
+                .await
+                .context("github list user installations")?;
+            let body: UserInstallationsJson =
+                parse_ok(response, "github list user installations").await?;
+
+            let fetched = body.installations.len();
+            ids.extend(body.installations.into_iter().map(|i| i.id));
+
+            if !has_more_pages(fetched, ids.len(), body.total_count, INSTALLATIONS_PER_PAGE) {
+                break;
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// インストール時のユーザー認可で受け取った `code` の主が、
+    /// `installation_id` のインストールにアクセスできるかを GitHub に問い合わせる。
+    ///
+    /// これが `Ok(false)` なら、そのユーザーは当該インストールの持ち主でも
+    /// メンバーでもない（他人の installation_id を差し込まれた場合を含む）。
+    /// 通信できなかったときは `Err` を返すので、拒否と一時障害を取り違えない。
+    pub async fn verify_installation_access(
+        &self,
+        code: &str,
+        installation_id: i64,
+    ) -> Result<bool, anyhow::Error> {
+        let Some(user_access_token) = self.exchange_user_code(code).await? else {
+            return Ok(false);
+        };
+        let ids = self.list_user_installation_ids(&user_access_token).await?;
+        Ok(ids.contains(&installation_id))
     }
 }
 
@@ -363,33 +510,45 @@ mod tests {
 
     #[test]
     fn stops_when_page_is_not_full() {
-        assert!(!has_more_repositories(30, 30, Some(30)));
-        assert!(!has_more_repositories(0, 100, Some(100)));
+        assert!(!has_more_pages(30, 30, Some(30), REPOSITORIES_PER_PAGE));
+        assert!(!has_more_pages(0, 100, Some(100), REPOSITORIES_PER_PAGE));
     }
 
     #[test]
     fn continues_while_pages_are_full() {
         // 既定の 30 件で切れていた頃の境界。次のページを取りに行く。
-        assert!(has_more_repositories(
+        assert!(has_more_pages(
             REPOSITORIES_PER_PAGE,
             REPOSITORIES_PER_PAGE,
-            Some(250)
+            Some(250),
+            REPOSITORIES_PER_PAGE
         ));
         // total_count が無くても、満杯なら続ける
-        assert!(has_more_repositories(
+        assert!(has_more_pages(
             REPOSITORIES_PER_PAGE,
             REPOSITORIES_PER_PAGE,
-            None
+            None,
+            REPOSITORIES_PER_PAGE
         ));
     }
 
     #[test]
     fn stops_when_total_count_is_reached_on_a_full_page() {
-        assert!(!has_more_repositories(
+        assert!(!has_more_pages(
             REPOSITORIES_PER_PAGE,
             REPOSITORIES_PER_PAGE,
-            Some(REPOSITORIES_PER_PAGE)
+            Some(REPOSITORIES_PER_PAGE),
+            REPOSITORIES_PER_PAGE
         ));
+    }
+
+    #[test]
+    fn page_size_comes_from_the_argument() {
+        // per_page を引数で受ける（関数の中で定数を直に見ない）ことの回帰ガード。
+        // 同じ「30 件取れた」でも、1 ページ 30 件なら続き、1 ページ 100 件なら終わる。
+        // 定数を直に見る実装に戻すと、この 2 つが同じ結果になって落ちる。
+        assert!(has_more_pages(30, 30, Some(100), 30));
+        assert!(!has_more_pages(30, 30, Some(100), 100));
     }
 
     fn now() -> DateTime<FixedOffset> {
