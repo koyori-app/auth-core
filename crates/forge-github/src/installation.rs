@@ -543,21 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn installations_paging_uses_its_own_page_size() {
-        // per_page を引数で受けるようにした回帰ガード。リポジトリ側の定数で
-        // 判定していると、1 ページ満杯のインストール一覧を打ち切ってしまう。
-        assert!(has_more_pages(
-            INSTALLATIONS_PER_PAGE,
-            INSTALLATIONS_PER_PAGE,
-            Some(INSTALLATIONS_PER_PAGE * 2),
-            INSTALLATIONS_PER_PAGE
-        ));
-        assert!(!has_more_pages(
-            INSTALLATIONS_PER_PAGE - 1,
-            INSTALLATIONS_PER_PAGE - 1,
-            None,
-            INSTALLATIONS_PER_PAGE
-        ));
+    fn page_size_comes_from_the_argument() {
+        // per_page を引数で受ける（関数の中で定数を直に見ない）ことの回帰ガード。
+        // 同じ「30 件取れた」でも、1 ページ 30 件なら続き、1 ページ 100 件なら終わる。
+        // 定数を直に見る実装に戻すと、この 2 つが同じ結果になって落ちる。
+        assert!(has_more_pages(30, 30, Some(100), 30));
+        assert!(!has_more_pages(30, 30, Some(100), 100));
     }
 
     fn now() -> DateTime<FixedOffset> {
