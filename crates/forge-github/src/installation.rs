@@ -366,7 +366,9 @@ impl GithubApp {
         match body.access_token {
             Some(token) if !token.is_empty() => Ok(Some(token)),
             // error も access_token も無い応答は想定外なので、拒否ではなく異常として扱う。
-            _ => Err(anyhow!("github exchange user code returned no access token")),
+            _ => Err(anyhow!(
+                "github exchange user code returned no access token"
+            )),
         }
     }
 
