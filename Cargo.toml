@@ -15,7 +15,7 @@ async-trait = "0.1"
 base64 = "0.22.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hkdf = "0.13"
-jsonwebtoken = { version = "9", features = ["use_pem"] }
+jsonwebtoken = { version = "10.3.0", features = ["use_pem", "aws_lc_rs"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
 serde = { version = "1.0.228", features = ["derive"] }
